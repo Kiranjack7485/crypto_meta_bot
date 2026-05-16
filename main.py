@@ -1,229 +1,138 @@
 import os
 import time
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 import pandas as pd
-import ta
 import requests
 from dotenv import load_dotenv
-import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
-# ===== CONFIG - UPDATED FOR IST =====
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT']
-LEVERAGE = 5
-RISK_PER_TRADE = 0.015 # 1.5% account risk
-DAILY_STOP = -0.03 # -3% stop trading
-DAILY_GOAL = 0.06 # +6% quit for day
-
-# US/London Overlap in US/Eastern time
-SESSION_START_ET = 8 # 8am ET
-SESSION_END_ET = 12 # 12pm ET
-ET_TIMEZONE = pytz.timezone('US/Eastern') # Auto handles EST/EDT
 IST_TIMEZONE = pytz.timezone('Asia/Kolkata')
+TIMEFRAME = '5m'
+SWING_LOOKBACK = 5
 
-SESSION_START = 8 # Keep for display only
-SESSION_END = 12
-
-SWEEP_LOOKBACK_H1 = 20
-STOP_BUFFER_PCT = 0.006 # 0.6% SL from sweep wick
-
-# ===== TELEGRAM =====
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
+# ===== FIX: Create resilient session and attach to Client after init =====
+session = requests.Session()
+retry = Retry(
+    total=3,
+    read=3,
+    connect=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504]
+)
+adapter = HTTPAdapter(max_retries=retry)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
+
+# Init Client normally
+client = Client(
+    os.getenv('BINANCE_API_KEY'),
+    os.getenv('BINANCE_API_SECRET'),
+    requests_params={'timeout': 20}
+)
+# Now patch the session - this is the correct way
+client.session = session
+
+state = {sym: {'trend': 'NONE', 'last_hh': 0, 'last_hl': 0, 'last_lh': 999999, 'last_ll': 999999} for sym in SYMBOLS}
+last_error_time = {sym: 0 for sym in SYMBOLS}
+
 def send_tg(msg):
     if not BOT_TOKEN or not CHAT_ID:
-        print(f"[TG DISABLED] {msg}")
+        print(msg)
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
-    except Exception as e:
-        logging.error(f"Telegram error: {e}")
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                     json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+    except: pass
 
-# ===== EXCHANGE =====
-client = Client(os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_API_SECRET'))
+def get_swings(df):
+    highs = df['h'].values
+    lows = df['l'].values
+    swing_highs = []
+    swing_lows = []
+    for i in range(SWING_LOOKBACK, len(df) - SWING_LOOKBACK):
+        if all(highs[i] > highs[i-j] for j in range(1, SWING_LOOKBACK+1)) and \
+           all(highs[i] > highs[i+j] for j in range(1, SWING_LOOKBACK+1)):
+            swing_highs.append({'idx': i, 'price': highs[i], 'time': df.index[i]})
+        if all(lows[i] < lows[i-j] for j in range(1, SWING_LOOKBACK+1)) and \
+           all(lows[i] < lows[i+j] for j in range(1, SWING_LOOKBACK+1)):
+            swing_lows.append({'idx': i, 'price': lows[i], 'time': df.index[i]})
+    return swing_highs, swing_lows
 
-# ===== STATE =====
-daily_pnl = 0
-trade_count = 0
-active_session = False
-last_session_date = None
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-
-def is_trading_time():
-    """Check if current IST time falls in 8am-12pm US/Eastern, accounting for DST"""
-    now_ist = datetime.now(IST_TIMEZONE)
-    now_et = now_ist.astimezone(ET_TIMEZONE)
-
-    if now_et.weekday() >= 5: # Sat/Sun in US
-        return False
-    return SESSION_START_ET <= now_et.hour < SESSION_END_ET
-
-def get_session_times_ist():
-    """Helper to show current session times in IST for Telegram"""
-    now_ist = datetime.now(IST_TIMEZONE)
-    now_et = now_ist.astimezone(ET_TIMEZONE)
-
-    # Create today's session start/end in ET, convert to IST
-    session_start_et = now_et.replace(hour=SESSION_START_ET, minute=0, second=0, microsecond=0)
-    session_end_et = now_et.replace(hour=SESSION_END_ET, minute=0, second=0, microsecond=0)
-
-    start_ist = session_start_et.astimezone(IST_TIMEZONE).strftime('%I:%M %p IST')
-    end_ist = session_end_et.astimezone(IST_TIMEZONE).strftime('%I:%M %p IST')
-    return f"{start_ist} - {end_ist}"
-
-def get_htf_levels(symbol):
-    try:
-        klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1DAY, limit=2)
-        prev_day_high = float(klines[-2][2])
-        prev_day_low = float(klines[-2][3])
-
-        klines_4h = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_4HOUR, limit=SWEEP_LOOKBACK_H1)
-        highs = [float(k[2]) for k in klines_4h]
-        lows = [float(k[3]) for k in klines_4h]
-        return {'pdh': prev_day_high, 'pdl': prev_day_low, 'h4_high': max(highs), 'h4_low': min(lows)}
-    except Exception as e:
-        logging.error(f"Error fetching HTF levels {symbol}: {e}")
+def detect_structure(symbol):
+    global last_error_time
+    if time.time() - last_error_time[symbol] < 300:
         return None
-
-def get_1m_data(symbol):
     try:
-        klines = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=50)
+        klines = client.get_klines(symbol=symbol, interval=TIMEFRAME, limit=100)
         df = pd.DataFrame(klines, columns=['ts','o','h','l','c','v','ct','qav','nt','tbbav','tbqav','ig'])
         df[['o','h','l','c']] = df[['o','h','l','c']].astype(float)
-        return df
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        df.set_index('ts', inplace=True)
+        swing_highs, swing_lows = get_swings(df)
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return None
+        hh1, hh2 = swing_highs[-1], swing_highs[-2]
+        ll1, ll2 = swing_lows[-1], swing_lows[-2]
+        current_price = df['c'].iloc[-1]
+        s = state[symbol]
+        msg = None
+        if hh2['price'] > hh1['price'] and ll1['price'] > ll2['price'] and current_price > hh2['price']:
+            if s['trend']!= 'UP':
+                s['trend'] = 'UP'
+                s['last_hh'] = hh2['price']
+                s['last_hl'] = ll1['price']
+                msg = f"🟢 *UPTREND START* 🟢\n`{symbol}` | {TIMEFRAME}\nBroke HH: `${hh2['price']:.4f}`\nLast HL: `${ll1['price']:.4f}`\nNow: `${current_price:.4f}`"
+        elif s['trend'] == 'UP' and current_price < s['last_hl']:
+            s['trend'] = 'DOWN'
+            s['last_ll'] = current_price
+            msg = f"🔴 *UPTREND ENDED* 🔴\n`{symbol}` | {TIMEFRAME}\nBroke HL: `${s['last_hl']:.4f}`\nNow: `${current_price:.4f}`"
+        elif ll2['price'] < ll1['price'] and hh1['price'] < hh2['price'] and current_price < ll2['price']:
+            if s['trend']!= 'DOWN':
+                s['trend'] = 'DOWN'
+                s['last_ll'] = ll2['price']
+                s['last_lh'] = hh1['price']
+                msg = f"🔴 *DOWNTREND START* 🔴\n`{symbol}` | {TIMEFRAME}\nBroke LL: `${ll2['price']:.4f}`\nLast LH: `${hh1['price']:.4f}`\nNow: `${current_price:.4f}`"
+        elif s['trend'] == 'DOWN' and current_price > s['last_lh']:
+            s['trend'] = 'UP'
+            s['last_hh'] = current_price
+            msg = f"🟢 *DOWNTREND ENDED* 🟢\n`{symbol}` | {TIMEFRAME}\nBroke LH: `${s['last_lh']:.4f}`\nNow: `${current_price:.4f}`"
+        return msg
+    except (BinanceAPIException, BinanceRequestException, requests.exceptions.RequestException) as e:
+        last_error_time[symbol] = time.time()
+        print(f"API error {symbol}: {str(e)[:100]}")
+        if int(time.time()) % 3600 < 60:
+            send_tg(f"⚠️ *API Hiccup* ⚠️\n`{symbol}` timeout. Retrying...")
+        return None
     except Exception as e:
-        logging.error(f"Error fetching 1m {symbol}: {e}")
+        print(f"Logic error {symbol}: {e}")
         return None
-
-def detect_signal(symbol, df_1m, levels):
-    if df_1m is None or len(df_1m) < 3:
-        return None
-
-    last = df_1m.iloc[-1]
-    prev = df_1m.iloc[-2]
-
-    swept_high = prev['h'] > levels['pdh'] and prev['c'] < levels['pdh']
-    swept_low = prev['l'] < levels['pdl'] and prev['c'] > levels['pdl']
-
-    if not (swept_high or swept_low):
-        return None
-
-    direction = 'SHORT' if swept_high else 'LONG'
-
-    if direction == 'SHORT' and last['c'] > levels['pdh']:
-        return None
-    if direction == 'LONG' and last['c'] < levels['pdl']:
-        return None
-
-    entry = last['c']
-
-    if direction == 'SHORT':
-        stop = prev['h'] * (1 + STOP_BUFFER_PCT)
-        tp1 = entry * 0.99 # 1% move
-        tp2 = entry * 0.98 # 2% move
-    else:
-        stop = prev['l'] * (1 - STOP_BUFFER_PCT)
-        tp1 = entry * 1.01
-        tp2 = entry * 1.02
-
-    rr = abs(tp1 - entry) / abs(entry - stop)
-    if rr < 1.5:
-        return None
-
-    return {
-        'symbol': symbol,
-        'direction': direction,
-        'entry': round(entry, 4),
-        'stop': round(stop, 4),
-        'tp1': round(tp1, 4),
-        'tp2': round(tp2, 4),
-        'rr': round(rr, 2),
-        'size_5x_pct': f"{LEVERAGE * abs(tp1/entry - 1) * 100:.1f}%"
-    }
-
-def format_signal(sig):
-    return f"""
-🚨 *GOLDEN SIGNAL FOUND* 🚨
-
-*Coin:* `{sig['symbol']}`
-*Trend:* `{sig['direction']}`
-*Entry:* `{sig['entry']}`
-*Stop Loss:* `{sig['stop']}` | Risk: {abs(sig['entry']/sig['stop']-1)*100:.2f}%
-*TP1:* `{sig['tp1']}` | Gain 5x: `{sig['size_5x_pct']}`
-*TP2:* `{sig['tp2']}` | Gain 5x: `{LEVERAGE * abs(sig['tp2']/sig['entry'] - 1) * 100:.1f}%`
-*R:R to TP1:* `1:{sig['rr']}`
-
-_Action:_ Take 70% at TP1, move SL to BE, run 30% to TP2.
-_Daily Stats:_ Trades: {trade_count}/4 | PnL: {daily_pnl*100:.2f}%
-""".strip()
 
 def main():
-    global daily_pnl, trade_count, active_session, last_session_date
-
-    session_window = get_session_times_ist()
-    send_tg(f"✅ *Scalp Bot Online - IST Adjusted*\nMonitoring: {', '.join(SYMBOLS)}\nSession: {session_window}\nAuto DST handled.")
-
+    send_tg(f"👁️ *Structure Bot Online - Stable*\nWatching: {', '.join(SYMBOLS)}\nTF: {TIMEFRAME} | Timeout: 20s + 3 retries")
     while True:
         try:
-            now_ist = datetime.now(IST_TIMEZONE)
-            now_et = now_ist.astimezone(ET_TIMEZONE)
-
-            if is_trading_time():
-                if not active_session:
-                    active_session = True
-                    last_session_date = now_et.date()
-                    daily_pnl = 0
-                    trade_count = 0
-                    send_tg(f"🟢 *TRADING SESSION START* 🟢\n{now_ist.strftime('%Y-%m-%d %I:%M %p IST')}\nNY Time: {now_et.strftime('%I:%M %p ET')}\nGood hunting.")
-
-                if daily_pnl <= DAILY_STOP:
-                    send_tg(f"🛑 *DAILY STOP HIT* 🛑\nPnL: {daily_pnl*100:.2f}%\nShutting down for the day.")
-                    active_session = False
-                    time.sleep(3600)
-                    continue
-                if daily_pnl >= DAILY_GOAL:
-                    send_tg(f"🏆 *DAILY GOAL HIT* 🏆\nPnL: {daily_pnl*100:.2f}%\nStop trading. See you tomorrow.")
-                    active_session = False
-                    time.sleep(3600)
-                    continue
-                if trade_count >= 4:
-                    send_tg("⚠️ *MAX TRADES REACHED* ⚠️\n4 trades done. Session closed.")
-                    active_session = False
-                    time.sleep(3600)
-                    continue
-
-                for symbol in SYMBOLS:
-                    levels = get_htf_levels(symbol)
-                    if not levels:
-                        continue
-                    df_1m = get_1m_data(symbol)
-                    sig = detect_signal(symbol, df_1m, levels)
-                    if sig:
-                        trade_count += 1
-                        send_tg(format_signal(sig))
-                        time.sleep(10)
-
-                time.sleep(30)
-
-            else:
-                if active_session:
-                    active_session = False
-                    send_tg(f"🔴 *SESSION END* 🔴\n{now_ist.strftime('%I:%M %p IST')}\nFinal PnL: {daily_pnl*100:.2f}% | Trades: {trade_count}")
-                time.sleep(300)
-
+            for sym in SYMBOLS:
+                alert = detect_structure(sym)
+                if alert:
+                    send_tg(alert)
+                    time.sleep(2)
+            time.sleep(60)
         except KeyboardInterrupt:
-            send_tg("🔌 *Bot Stopped Manually*")
+            send_tg("🔌 *Structure Bot Stopped*")
             break
         except Exception as e:
-            logging.error(f"Main loop error: {e}")
-            send_tg(f"⚠️ *BOT ERROR* ⚠️\n`{str(e)[:200]}`\nRestarting in 60s...")
+            print(f"Main loop crash: {e}")
+            send_tg(f"💥 *Bot Main Loop Crash*\n`{str(e)[:200]}`\nRestarting in 60s...")
             time.sleep(60)
 
 if __name__ == "__main__":
