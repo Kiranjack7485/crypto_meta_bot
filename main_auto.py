@@ -47,7 +47,7 @@ client.API_URL = 'https://fapi.binance.com'
 
 # ===== STATE =====
 active_trade = None
-daily_stats = {'date': datetime.now(IST_TIMEZONE).date(), 'trades': [], 'start_balance': 0}
+daily_stats = {'date': datetime.now(IST_TIMEZONE).date(), 'trades': [], 'start_balance': 0, 'last_known_balance': 0}
 last_signal = {sym: 0 for sym in SYMBOLS}
 last_heartbeat = 0
 
@@ -60,19 +60,23 @@ def send_tg(msg, silent=False):
         print(f"TG Error: {e}")
 
 def get_futures_balance():
-    try:
-        balances = client.futures_account_balance()
-        usdt = next(b for b in balances if b['asset'] == 'USDT')
-        return float(usdt['availableBalance'])
-    except BinanceAPIException as e:
-        send_tg(f"⚠ *Balance Error*\n`APIError(code={e.code}): {e.message}`")
-        return 0
-    except Exception as e:
-        send_tg(f"⚠ *Balance Error*\n`{str(e)[:100]}`")
-        return 0
+    global daily_stats
+    for attempt in range(3):
+        try:
+            balances = client.futures_account_balance()
+            usdt = next(b for b in balances if b['asset'] == 'USDT')
+            bal = float(usdt['availableBalance'])
+            daily_stats['last_known_balance'] = bal
+            return bal
+        except (BinanceAPIException, ConnectionResetError, requests.exceptions.RequestException, Exception) as e:
+            if attempt == 2:
+                last_bal = daily_stats.get('last_known_balance', 0)
+                send_tg(f"⚠ *Balance Fetch Failed*\n`{str(e)[:80]}`\nUsing cached: `${last_bal:.2f}`")
+                return last_bal
+            time.sleep(2)
+    return 0
 
 def get_step_size(symbol):
-    # Binance step sizes for futures
     if symbol in ['BTCUSDT', 'ETHUSDT']:
         return 0.001
     elif symbol == 'SOLUSDT':
@@ -233,25 +237,21 @@ def execute_trade(signal):
     if sl_dist_pct == 0: 
         return False
     
-    # Calculate leverage based on risk, but ensure we don't exceed available capital
     risk_amount = balance * RISK_PER_TRADE_PCT
     raw_leverage = risk_amount / (capital_to_use * sl_dist_pct)
     leverage = min(MAX_LEVERAGE, max(MIN_LEVERAGE, int(raw_leverage)))
     
-    # CRITICAL FIX: Floor qty to step size to avoid margin errors
     step_size = get_step_size(symbol)
     raw_qty = (capital_to_use * leverage) / signal['entry']
     qty = floor(raw_qty / step_size) * step_size
     
-    # Binance minimum notional is $5
     notional = qty * signal['entry']
     if qty == 0 or notional < 5:
         send_tg(f"❌ *{symbol} Qty too small*\nNotional: ${notional:.2f} < $5 min")
         return False
     
-    # Verify margin required doesn't exceed what we allocated
     margin_needed = notional / leverage
-    if margin_needed > capital_to_use * 1.02: # 2% buffer for fees
+    if margin_needed > capital_to_use * 1.02:
         send_tg(f"❌ *Margin Check Failed {symbol}*\nNeed: ${margin_needed:.2f}\nHave: ${capital_to_use:.2f}")
         return False
     
@@ -321,7 +321,9 @@ def send_daily_report():
         daily_stats['start_balance'] = get_futures_balance()
 
 def main():
-    global last_heartbeat
+    global last_heartbeat, daily_stats
+    daily_stats['last_known_balance'] = 0
+    
     if BINANCE_TESTNET:
         send_tg("🧪 *TESTNET MODE* 🧪\nPaper trading. No real money.")
     else:
@@ -331,11 +333,12 @@ def main():
         client.futures_ping()
         print("Futures API ping OK")
     except Exception as e:
-        send_tg(f"❌ *Futures Ping Failed*\n`{str(e)[:200]}`\n\nFix: Binance API Key → Edit → Enable Futures → Save")
+        send_tg(f"❌ *Futures Ping Failed*\n`{str(e)[:200]}`")
         return
 
     start_bal = get_futures_balance()
     daily_stats['start_balance'] = start_bal
+    daily_stats['last_known_balance'] = start_bal
     if start_bal == 0:
         send_tg("❌ *CRITICAL: Balance $0*\nCheck API permissions or transfer USDT to Futures wallet")
         return
@@ -344,7 +347,8 @@ def main():
     while True:
         try:
             if time.time() - last_heartbeat > 1800:
-                send_tg(f"💓 *Heartbeat*\nAlive. Balance: `${get_futures_balance():.2f}`\nActive trade: {active_trade['symbol'] if active_trade else 'None'}", silent=True)
+                current_bal = get_futures_balance()
+                send_tg(f"💓 *Heartbeat*\nAlive. Balance: `${current_bal:.2f}`\nActive trade: {active_trade['symbol'] if active_trade else 'None'}", silent=True)
                 last_heartbeat = time.time()
 
             send_daily_report()
