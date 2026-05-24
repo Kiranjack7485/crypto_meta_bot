@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 from math import floor
+from decimal import Decimal, ROUND_DOWN
 
 # ===== FORCE LOAD ENV FIRST =====
 load_dotenv(override=True)
@@ -32,12 +33,11 @@ TRADING_START = dt_time(18, 0)
 TRADING_END = dt_time(23, 30)
 
 IST_TIMEZONE = pytz.timezone('Asia/Kolkata')
-REPORT_TIME = dt_time(23, 30)  # 11:30 PM IST = Session close
+REPORT_TIME = dt_time(23, 30)
 
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# Separate keys for testnet vs live
 if BINANCE_TESTNET:
     API_KEY = os.getenv('BINANCE_TESTNET_API_KEY')
     API_SECRET = os.getenv('BINANCE_TESTNET_API_SECRET')
@@ -53,7 +53,6 @@ if not BOT_TOKEN or not CHAT_ID:
 print(f"Mode: {'TESTNET' if BINANCE_TESTNET else 'LIVE'}")
 print(f"Loaded API Key: {API_KEY[:6]}...{API_KEY[-4:]}")
 
-# ===== BINANCE CLIENT WITH AUTO URL =====
 client = Client(API_KEY, API_SECRET, testnet=BINANCE_TESTNET)
 if BINANCE_TESTNET:
     client.API_URL = 'https://testnet.binancefuture.com'
@@ -96,10 +95,14 @@ def get_futures_balance():
             time.sleep(2)
     return 0
 
-def get_step_size(symbol):
-    if symbol in ['BTCUSDT', 'ETHUSDT']: return 0.001
-    elif symbol == 'SOLUSDT': return 0.01
-    else: return 0.001
+def get_symbol_precision(symbol):
+    # Returns (step_size, decimal_places)
+    if symbol in ['BTCUSDT', 'ETHUSDT']: 
+        return Decimal('0.001'), 3
+    elif symbol == 'SOLUSDT': 
+        return Decimal('0.01'), 2
+    else: 
+        return Decimal('0.001'), 3
 
 def set_leverage(symbol, leverage):
     try:
@@ -293,9 +296,10 @@ def execute_trade(signal):
     raw_leverage = risk_amount / (capital_to_use * sl_dist_pct)
     leverage = min(MAX_LEVERAGE, max(MIN_LEVERAGE, int(raw_leverage)))
     
-    step_size = get_step_size(symbol)
-    raw_qty = (capital_to_use * leverage) / signal['entry']
-    qty = floor(raw_qty / step_size) * step_size
+    # CRITICAL FIX: Use Decimal for exact precision
+    step_size, decimals = get_symbol_precision(symbol)
+    raw_qty = Decimal(str(capital_to_use * leverage / signal['entry']))
+    qty = float(raw_qty.quantize(step_size, rounding=ROUND_DOWN))
     
     notional = qty * signal['entry']
     if qty == 0 or notional < 5:
@@ -380,7 +384,6 @@ def send_daily_closeup_report():
             
             report_sent_today = True
     
-    # Reset at midnight
     if now.date() > daily_stats['date']:
         daily_stats['date'] = now.date()
         daily_stats['trades'] = []
