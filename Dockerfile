@@ -11,9 +11,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy only Python files, NOT .env
-COPY main_auto.py .
+COPY main.py .
 
 ENV PYTHONUNBUFFERED=1
 ENV TZ=Asia/Kolkata
 
-CMD ["python", "main_auto.py"]
+CMD ["python", "main.py"]
